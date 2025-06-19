@@ -8,7 +8,7 @@ A unified FastAPI backend server for fetching current and historical stock marke
 - **Multiple ticker support**: POST method for batch stock queries
 - **Error handling**: Graceful error handling per ticker
 - **Real-time data**: Current stock prices, changes, volume, and market data
-- **Historical data**: Configurable periods and intervals
+- **Historical data**: Custom date ranges and configurable intervals
 - **Company information**: Comprehensive fundamental data and metrics
 - **Dividend analysis**: Complete dividend history and calculations
 - **Stock splits tracking**: Historical splits with cumulative factors
@@ -70,15 +70,28 @@ curl -X POST "http://localhost:8000/current" \
 
 ### 2. Historical Stock Data - `/historical`
 
-Get historical stock data with configurable periods and intervals.
+Get historical stock data with custom date ranges and configurable intervals.
 
-#### Multiple Tickers (POST)
+#### Multiple Tickers with Date Ranges (POST)
 
 ```bash
-# Post multiple tickers with parameters
-curl -X POST "http://localhost:8000/historical?period=3mo&interval=1d" \
+# Post multiple tickers with individual date ranges
+curl -X POST "http://localhost:8000/historical?interval=1d" \
   -H "Content-Type: application/json" \
-  -d '{"tickers": ["AAPL", "MSFT", "GOOGL"]}'
+  -d '{
+    "tickers": [
+      {
+        "ticker": "AAPL",
+        "start_date": "2023-01-01",
+        "end_date": "2023-12-31"
+      },
+      {
+        "ticker": "MSFT",
+        "start_date": "2023-06-01",
+        "end_date": "2023-12-31"
+      }
+    ]
+  }'
 ```
 
 **Response Format:**
@@ -101,7 +114,6 @@ curl -X POST "http://localhost:8000/historical?period=3mo&interval=1d" \
       "error": null
     }
   ],
-  "period": "1mo",
   "timestamp": "2024-01-15T10:30:00.123456"
 }
 ```
@@ -239,7 +251,8 @@ curl -X POST "http://localhost:8000/splits" \
 
 ### Historical Data Parameters
 
-- **period**: `1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `10y`, `ytd`, `max`
+- **start_date**: Start date in `YYYY-MM-DD` format (required for each ticker)
+- **end_date**: End date in `YYYY-MM-DD` format (required for each ticker)
 - **interval**: `1m`, `2m`, `5m`, `15m`, `30m`, `60m`, `90m`, `1h`, `1d`, `5d`, `1wk`, `1mo`, `3mo`
 
 ## Usage Examples
@@ -254,11 +267,24 @@ const response = await fetch("http://localhost:8000/current", {
   body: JSON.stringify({ tickers: ["AAPL", "MSFT", "GOOGL"] }),
 });
 
-// Historical data for multiple tickers (POST)
-const response = await fetch("http://localhost:8000/historical?period=1mo&interval=1d", {
+// Historical data for multiple tickers with date ranges (POST)
+const response = await fetch("http://localhost:8000/historical?interval=1d", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ tickers: ["AAPL", "MSFT", "GOOGL"] }),
+  body: JSON.stringify({
+    tickers: [
+      {
+        ticker: "AAPL",
+        start_date: "2023-01-01",
+        end_date: "2023-12-31",
+      },
+      {
+        ticker: "MSFT",
+        start_date: "2023-06-01",
+        end_date: "2023-12-31",
+      },
+    ],
+  }),
 });
 
 // Company info for multiple tickers (POST)
@@ -292,10 +318,23 @@ import requests
 response = requests.post('http://localhost:8000/current',
                         json={'tickers': ['AAPL', 'MSFT', 'GOOGL']})
 
-# Historical data for multiple tickers (POST)
+# Historical data for multiple tickers with date ranges (POST)
 response = requests.post('http://localhost:8000/historical',
-                        json={'tickers': ['AAPL', 'MSFT', 'GOOGL']},
-                        params={'period': '1mo', 'interval': '1d'})
+                        json={
+                            'tickers': [
+                                {
+                                    'ticker': 'AAPL',
+                                    'start_date': '2023-01-01',
+                                    'end_date': '2023-12-31'
+                                },
+                                {
+                                    'ticker': 'MSFT',
+                                    'start_date': '2023-06-01',
+                                    'end_date': '2023-12-31'
+                                }
+                            ]
+                        },
+                        params={'interval': '1d'})
 
 # Company info for multiple tickers (POST)
 response = requests.post('http://localhost:8000/info',
