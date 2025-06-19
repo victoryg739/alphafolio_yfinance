@@ -60,11 +60,19 @@ class HistoricalStock(BaseModel):
 
 class HistoricalDataResponse(BaseModel):
     stocks: List[HistoricalStock]
-    period: str
     timestamp: datetime = Field(default_factory=datetime.now)
 
 class TickersRequest(BaseModel):
     tickers: List[str]
+
+# New models for date-based historical requests
+class TickerDateRequest(BaseModel):
+    ticker: str
+    start_date: str = Field(..., description="Start date in YYYY-MM-DD format")
+    end_date: str = Field(..., description="End date in YYYY-MM-DD format")
+
+class HistoricalTickersRequest(BaseModel):
+    tickers: List[TickerDateRequest]
 
 # New models for stock info
 class StockInfo(BaseModel):
@@ -166,15 +174,15 @@ def get_stock_info(ticker: str) -> StockPrice:
         logger.error(f"Error fetching data for {ticker}: {str(e)}")
         return StockPrice(ticker=ticker, error=str(e))
 
-# Helper function to get historical data for a single ticker
-def get_historical_info(ticker: str, period: str, interval: str) -> HistoricalStock:
+# Helper function to get historical data for a single ticker with date range
+def get_historical_info(ticker: str, start_date: str, end_date: str, interval: str = "1d") -> HistoricalStock:
     try:
-        logger.info(f"Fetching historical data for {ticker} with period {period}")
+        logger.info(f"Fetching historical data for {ticker} from {start_date} to {end_date}")
         stock = yf.Ticker(ticker.upper())
-        hist = stock.history(period=period, interval=interval)
+        hist = stock.history(start=start_date, end=end_date, interval=interval)
         
         if hist.empty:
-            return HistoricalStock(ticker=ticker.upper(), data=[], error=f"No historical data found for {ticker}")
+            return HistoricalStock(ticker=ticker.upper(), data=[], error=f"No historical data found for {ticker} between {start_date} and {end_date}")
         
         data_points = []
         for date, row in hist.iterrows():
@@ -327,7 +335,7 @@ async def root():
         "version": "2.2.0",
         "endpoints": {
             "/current": "Get current stock data for multiple tickers (POST)",
-            "/historical": "Get historical stock data for multiple tickers (POST)",
+            "/historical": "Get historical stock data for multiple tickers with date ranges (POST)",
             "/info": "Get company information for multiple tickers (POST)",
             "/dividends": "Get dividend history for multiple tickers (POST)",
             "/splits": "Get stock split history for multiple tickers (POST)",
@@ -349,22 +357,26 @@ async def get_current_data_post(request: TickersRequest):
     
     return CurrentDataResponse(stocks=stocks)
 
-# Historical data endpoint - Multiple tickers (POST)
+# Historical data endpoint - Multiple tickers with date ranges (POST)
 @app.post("/historical", response_model=HistoricalDataResponse)
 async def get_historical_data_post(
-    request: TickersRequest,
-    period: str = Query("1mo", description="Period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max"),
+    request: HistoricalTickersRequest,
     interval: str = Query("1d", description="Interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo")
 ):
-    """Get historical stock data for multiple tickers using POST method"""
-    logger.info(f"Fetching historical data for {len(request.tickers)} ticker(s)")
+    """Get historical stock data for multiple tickers with custom date ranges using POST method"""
+    logger.info(f"Fetching historical data for {len(request.tickers)} ticker(s) with date ranges")
     
     stocks = []
-    for ticker in request.tickers:
-        historical_data = get_historical_info(ticker, period, interval)
+    for ticker_request in request.tickers:
+        historical_data = get_historical_info(
+            ticker_request.ticker, 
+            ticker_request.start_date, 
+            ticker_request.end_date, 
+            interval
+        )
         stocks.append(historical_data)
     
-    return HistoricalDataResponse(stocks=stocks, period=period)
+    return HistoricalDataResponse(stocks=stocks)
 
 # Stock info endpoint - Multiple tickers (POST)
 @app.post("/info", response_model=StockInfoResponse)
