@@ -139,6 +139,17 @@ class SplitsResponse(BaseModel):
     stocks: List[StockSplits]
     timestamp: datetime = Field(default_factory=datetime.now)
 
+# New models for forex
+class ForexRate(BaseModel):
+    pair: str
+    rate: float
+    inverse_rate: float
+    last_updated: str
+
+class ForexResponse(BaseModel):
+    rates: List[ForexRate]
+    timestamp: datetime = Field(default_factory=datetime.now)
+
 # Helper function to get stock info
 def get_stock_info(ticker: str) -> StockPrice:
     try:
@@ -327,6 +338,70 @@ def get_splits_info(ticker: str) -> StockSplits:
         logger.error(f"Error fetching splits for {ticker}: {str(e)}")
         return StockSplits(ticker=ticker.upper(), splits=[], error=str(e))
 
+# New helper function to get forex rates for dedicated endpoint
+def get_forex_rates_detailed() -> List[ForexRate]:
+    try:
+        logger.info("Fetching forex rates")
+        
+        # Common currency pairs in YFinance format
+        forex_tickers = [
+            ('EURUSD=X', 'EUR/USD'),
+            ('GBPUSD=X', 'GBP/USD'), 
+            ('JPY=X', 'USD/JPY'),
+            ('CAD=X', 'USD/CAD'),
+            ('AUDUSD=X', 'AUD/USD'),
+            ('CHF=X', 'USD/CHF'),
+            ('CNY=X', 'USD/CNY'),
+        ]
+        
+        forex_rates = []
+        
+        for ticker, pair_name in forex_tickers:
+            try:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="2d")
+                
+                if not hist.empty:
+                    current_rate = hist['Close'].iloc[-1]
+                    last_date = hist.index[-1].strftime('%Y-%m-%d')
+                    
+                    # Convert to standard pair format (base/quote)
+                    if ticker in ['JPY=X', 'CAD=X', 'CHF=X', 'CNY=X']:
+                        # These are USD/XXX rates, convert to XXX/USD
+                        if ticker == 'JPY=X':
+                            display_pair = 'JPY/USD'
+                        elif ticker == 'CAD=X':
+                            display_pair = 'CAD/USD'
+                        elif ticker == 'CHF=X':
+                            display_pair = 'CHF/USD'
+                        elif ticker == 'CNY=X':
+                            display_pair = 'CNY/USD'
+                        
+                        actual_rate = 1 / current_rate if current_rate != 0 else 0
+                        inverse_rate = current_rate
+                    else:
+                        # These are already in XXX/USD format (EURUSD=X, GBPUSD=X, AUDUSD=X)
+                        display_pair = pair_name
+                        actual_rate = current_rate
+                        inverse_rate = 1 / current_rate if current_rate != 0 else 0
+                    
+                    forex_rates.append(ForexRate(
+                        pair=display_pair,
+                        rate=round(actual_rate, 6),
+                        inverse_rate=round(inverse_rate, 6),
+                        last_updated=last_date
+                    ))
+                    
+            except Exception as e:
+                logger.error(f"Error fetching forex rate for {ticker}: {str(e)}")
+                continue
+        
+        return forex_rates
+        
+    except Exception as e:
+        logger.error(f"Error fetching forex rates: {str(e)}")
+        return []
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -339,6 +414,7 @@ async def root():
             "/info": "Get company information for multiple tickers (POST)",
             "/dividends": "Get dividend history for multiple tickers (POST)",
             "/splits": "Get stock split history for multiple tickers (POST)",
+            "/forex": "Get current forex exchange rates",
             "/health": "Health check",
             "/docs": "API documentation"
         }
@@ -416,6 +492,15 @@ async def get_splits_post(request: TickersRequest):
         stocks.append(splits_data)
     
     return SplitsResponse(stocks=stocks)
+
+# Forex rates endpoint
+@app.get("/forex", response_model=ForexResponse)
+async def get_forex_rates_endpoint():
+    """Get current forex exchange rates"""
+    logger.info("Fetching forex rates")
+    
+    rates = get_forex_rates_detailed()
+    return ForexResponse(rates=rates)
 
 # Health check endpoint
 @app.get("/health")
