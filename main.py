@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
@@ -6,6 +6,13 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import logging
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+import json
+import time
+from functools import lru_cache
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +22,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="AlphaFolio YFinance API",
     description="A unified backend server for fetching current and historical stock market data using Yahoo Finance",
-    version="2.2.0"
+    version="3.0.0"
 )
 
 # Add CORS middleware
@@ -26,6 +33,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# In-memory cache with TTL
+class MemoryCache:
+    def __init__(self):
+        self._cache = {}
+        self._timestamps = {}
+        
+    def _generate_key(self, *args) -> str:
+        """Generate cache key from arguments"""
+        key_string = json.dumps(args, sort_keys=True, default=str)
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    def get(self, key: str, ttl_seconds: int = 300) -> Optional[Any]:
+        """Get value from cache if not expired"""
+        if key in self._cache:
+            age = time.time() - self._timestamps[key]
+            if age < ttl_seconds:
+                logger.info(f"Cache HIT for key: {key[:20]}...")
+                return self._cache[key]
+            else:
+                # Remove expired entry
+                del self._cache[key]
+                del self._timestamps[key]
+        return None
+    
+    def set(self, key: str, value: Any) -> None:
+        """Set value in cache"""
+        self._cache[key] = value
+        self._timestamps[key] = time.time()
+        logger.info(f"Cache SET for key: {key[:20]}...")
+    
+    def clear_expired(self, ttl_seconds: int = 300) -> None:
+        """Clear expired entries"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, timestamp in self._timestamps.items()
+            if current_time - timestamp > ttl_seconds
+        ]
+        for key in expired_keys:
+            del self._cache[key]
+            del self._timestamps[key]
+
+# Global cache instance
+cache = MemoryCache()
+
+# Cache TTL settings (in seconds)
+CACHE_TTL = {
+    "current": 15 * 60,        # 15 minutes for current prices
+    "historical": 24 * 60 * 60, # 24 hours for historical data
+    "info": 7 * 24 * 60 * 60,   # 7 days for company info
+    "dividends": 24 * 60 * 60,  # 24 hours for dividends
+    "splits": 24 * 60 * 60,     # 24 hours for splits
+}
+
+# Thread pool for parallel processing
+executor = ThreadPoolExecutor(max_workers=10)
 
 # Pydantic models for request/response
 class StockPrice(BaseModel):
@@ -139,51 +202,58 @@ class SplitsResponse(BaseModel):
     stocks: List[StockSplits]
     timestamp: datetime = Field(default_factory=datetime.now)
 
-# New models for forex
-class ForexRate(BaseModel):
-    pair: str
-    rate: float
-    inverse_rate: float
-    last_updated: str
 
-class ForexResponse(BaseModel):
-    rates: List[ForexRate]
-    timestamp: datetime = Field(default_factory=datetime.now)
+# Enhanced helper functions with caching and async support
 
-# Helper function to get stock info
-def get_stock_info(ticker: str) -> StockPrice:
+def get_stock_info_cached(ticker: str) -> StockPrice:
+    """Get stock info with caching"""
+    cache_key = cache._generate_key("current", ticker.upper())
+    cached_result = cache.get(cache_key, CACHE_TTL["current"])
+    
+    if cached_result:
+        return StockPrice(**cached_result)
+    
     try:
         stock = yf.Ticker(ticker.upper())
         info = stock.info
         hist = stock.history(period="2d")
         
         if hist.empty:
-            return StockPrice(ticker=ticker, error="No data available")
+            result = StockPrice(ticker=ticker, error="No data available")
+        else:
+            current_price = hist['Close'].iloc[-1] if len(hist) > 0 else None
+            previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else None
+            
+            change = None
+            change_percent = None
+            if current_price and previous_close:
+                change = current_price - previous_close
+                change_percent = (change / previous_close) * 100
+            
+            result = StockPrice(
+                ticker=ticker.upper(),
+                current_price=round(current_price, 2) if current_price else None,
+                previous_close=round(previous_close, 2) if previous_close else None,
+                market_cap=info.get('marketCap'),
+                volume=hist['Volume'].iloc[-1] if len(hist) > 0 else None,
+                day_high=round(hist['High'].iloc[-1], 2) if len(hist) > 0 else None,
+                day_low=round(hist['Low'].iloc[-1], 2) if len(hist) > 0 else None,
+                change=round(change, 2) if change else None,
+                change_percent=round(change_percent, 2) if change_percent else None,
+                currency=info.get('currency', 'USD')
+            )
         
-        current_price = hist['Close'].iloc[-1] if len(hist) > 0 else None
-        previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else None
+        # Cache the result
+        cache.set(cache_key, result.dict())
+        return result
         
-        change = None
-        change_percent = None
-        if current_price and previous_close:
-            change = current_price - previous_close
-            change_percent = (change / previous_close) * 100
-        
-        return StockPrice(
-            ticker=ticker.upper(),
-            current_price=round(current_price, 2) if current_price else None,
-            previous_close=round(previous_close, 2) if previous_close else None,
-            market_cap=info.get('marketCap'),
-            volume=hist['Volume'].iloc[-1] if len(hist) > 0 else None,
-            day_high=round(hist['High'].iloc[-1], 2) if len(hist) > 0 else None,
-            day_low=round(hist['Low'].iloc[-1], 2) if len(hist) > 0 else None,
-            change=round(change, 2) if change else None,
-            change_percent=round(change_percent, 2) if change_percent else None,
-            currency=info.get('currency', 'USD')
-        )
     except Exception as e:
         logger.error(f"Error fetching data for {ticker}: {str(e)}")
         return StockPrice(ticker=ticker, error=str(e))
+
+# Legacy function for backward compatibility
+def get_stock_info(ticker: str) -> StockPrice:
+    return get_stock_info_cached(ticker)
 
 # Helper function to get historical data for a single ticker with date range
 def get_historical_info(ticker: str, start_date: str, end_date: str, interval: str = "1d") -> HistoricalStock:
@@ -338,84 +408,153 @@ def get_splits_info(ticker: str) -> StockSplits:
         logger.error(f"Error fetching splits for {ticker}: {str(e)}")
         return StockSplits(ticker=ticker.upper(), splits=[], error=str(e))
 
-# New helper function to get forex rates for dedicated endpoint
-def get_forex_rates_detailed() -> List[ForexRate]:
-    try:
-        logger.info("Fetching forex rates")
-        
-        # Common currency pairs in YFinance format
-        forex_tickers = [
-            ('EURUSD=X', 'EUR/USD'),
-            ('GBPUSD=X', 'GBP/USD'), 
-            ('JPY=X', 'USD/JPY'),
-            ('CAD=X', 'USD/CAD'),
-            ('AUDUSD=X', 'AUD/USD'),
-            ('CHF=X', 'USD/CHF'),
-            ('CNY=X', 'USD/CNY'),
-        ]
-        
-        forex_rates = []
-        
-        for ticker, pair_name in forex_tickers:
-            try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="2d")
-                
-                if not hist.empty:
-                    current_rate = hist['Close'].iloc[-1]
-                    last_date = hist.index[-1].strftime('%Y-%m-%d')
-                    
-                    # Convert to standard pair format (base/quote)
-                    if ticker in ['JPY=X', 'CAD=X', 'CHF=X', 'CNY=X']:
-                        # These are USD/XXX rates, convert to XXX/USD
-                        if ticker == 'JPY=X':
-                            display_pair = 'JPY/USD'
-                        elif ticker == 'CAD=X':
-                            display_pair = 'CAD/USD'
-                        elif ticker == 'CHF=X':
-                            display_pair = 'CHF/USD'
-                        elif ticker == 'CNY=X':
-                            display_pair = 'CNY/USD'
-                        
-                        actual_rate = 1 / current_rate if current_rate != 0 else 0
-                        inverse_rate = current_rate
-                    else:
-                        # These are already in XXX/USD format (EURUSD=X, GBPUSD=X, AUDUSD=X)
-                        display_pair = pair_name
-                        actual_rate = current_rate
-                        inverse_rate = 1 / current_rate if current_rate != 0 else 0
-                    
-                    forex_rates.append(ForexRate(
-                        pair=display_pair,
-                        rate=round(actual_rate, 6),
-                        inverse_rate=round(inverse_rate, 6),
-                        last_updated=last_date
-                    ))
-                    
-            except Exception as e:
-                logger.error(f"Error fetching forex rate for {ticker}: {str(e)}")
-                continue
-        
-        return forex_rates
-        
-    except Exception as e:
-        logger.error(f"Error fetching forex rates: {str(e)}")
-        return []
+
+
+# NEW: Batch endpoint models
+class BatchDataRequest(BaseModel):
+    tickers: List[str]
+    include_current: bool = True
+    include_info: bool = True
+    include_dividends: bool = True
+    include_splits: bool = True
+    include_historical: bool = False
+    historical_start_date: Optional[str] = None
+    historical_end_date: Optional[str] = None
+    historical_interval: str = "1d"
+
+class BatchTickerData(BaseModel):
+    ticker: str
+    current: Optional[StockPrice] = None
+    info: Optional[StockInfo] = None
+    dividends: Optional[StockDividends] = None
+    splits: Optional[StockSplits] = None
+    historical: Optional[HistoricalStock] = None
+    processing_time_ms: Optional[float] = None
+
+class BatchDataResponse(BaseModel):
+    tickers: List[BatchTickerData]
+    total_processing_time_ms: float
+    cached_responses: int
+    fresh_responses: int
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+# Enhanced batch processing function
+async def process_ticker_batch(ticker: str, request: BatchDataRequest) -> BatchTickerData:
+    """Process all requested data for a single ticker with caching"""
+    start_time = time.time()
+    
+    def run_in_thread(func, *args):
+        return executor.submit(func, *args)
+    
+    # Submit all tasks to thread pool
+    futures = {}
+    
+    if request.include_current:
+        futures['current'] = run_in_thread(get_stock_info_cached, ticker)
+    
+    if request.include_info:
+        futures['info'] = run_in_thread(get_company_info_cached, ticker)
+    
+    if request.include_dividends:
+        futures['dividends'] = run_in_thread(get_dividends_info_cached, ticker)
+    
+    if request.include_splits:
+        futures['splits'] = run_in_thread(get_splits_info_cached, ticker)
+    
+    if request.include_historical and request.historical_start_date and request.historical_end_date:
+        futures['historical'] = run_in_thread(
+            get_historical_info_cached, 
+            ticker, 
+            request.historical_start_date, 
+            request.historical_end_date, 
+            request.historical_interval
+        )
+    
+    # Collect results
+    results = {}
+    for key, future in futures.items():
+        try:
+            results[key] = future.result(timeout=30)  # 30 second timeout
+        except Exception as e:
+            logger.error(f"Error processing {key} for {ticker}: {str(e)}")
+            results[key] = None
+    
+    processing_time = (time.time() - start_time) * 1000
+    
+    return BatchTickerData(
+        ticker=ticker,
+        current=results.get('current'),
+        info=results.get('info'),
+        dividends=results.get('dividends'),
+        splits=results.get('splits'),
+        historical=results.get('historical'),
+        processing_time_ms=processing_time
+    )
+
+# Add cached versions of other helper functions
+def get_company_info_cached(ticker: str) -> StockInfo:
+    """Get company info with caching"""
+    cache_key = cache._generate_key("info", ticker.upper())
+    cached_result = cache.get(cache_key, CACHE_TTL["info"])
+    
+    if cached_result:
+        return StockInfo(**cached_result)
+    
+    result = get_company_info(ticker)  # Use existing function
+    cache.set(cache_key, result.dict())
+    return result
+
+def get_dividends_info_cached(ticker: str) -> StockDividends:
+    """Get dividends info with caching"""
+    cache_key = cache._generate_key("dividends", ticker.upper())
+    cached_result = cache.get(cache_key, CACHE_TTL["dividends"])
+    
+    if cached_result:
+        return StockDividends(**cached_result)
+    
+    result = get_dividends_info(ticker)  # Use existing function
+    cache.set(cache_key, result.dict())
+    return result
+
+def get_splits_info_cached(ticker: str) -> StockSplits:
+    """Get splits info with caching"""
+    cache_key = cache._generate_key("splits", ticker.upper())
+    cached_result = cache.get(cache_key, CACHE_TTL["splits"])
+    
+    if cached_result:
+        return StockSplits(**cached_result)
+    
+    result = get_splits_info(ticker)  # Use existing function
+    cache.set(cache_key, result.dict())
+    return result
+
+def get_historical_info_cached(ticker: str, start_date: str, end_date: str, interval: str = "1d") -> HistoricalStock:
+    """Get historical info with caching"""
+    cache_key = cache._generate_key("historical", ticker.upper(), start_date, end_date, interval)
+    cached_result = cache.get(cache_key, CACHE_TTL["historical"])
+    
+    if cached_result:
+        return HistoricalStock(**cached_result)
+    
+    result = get_historical_info(ticker, start_date, end_date, interval)  # Use existing function
+    cache.set(cache_key, result.dict())
+    return result
 
 # Root endpoint
 @app.get("/")
 async def root():
     return {
         "message": "AlphaFolio YFinance API",
-        "version": "2.2.0",
+        "version": "3.0.0",
         "endpoints": {
             "/current": "Get current stock data for multiple tickers (POST)",
             "/historical": "Get historical stock data for multiple tickers with date ranges (POST)",
             "/info": "Get company information for multiple tickers (POST)",
             "/dividends": "Get dividend history for multiple tickers (POST)",
             "/splits": "Get stock split history for multiple tickers (POST)",
-            "/forex": "Get current forex exchange rates",
+            "/batch": "🚀 NEW: Get all data types for multiple tickers in one request (POST)",
             "/health": "Health check",
+            "/cache/stats": "Cache statistics",
             "/docs": "API documentation"
         }
     }
@@ -493,14 +632,76 @@ async def get_splits_post(request: TickersRequest):
     
     return SplitsResponse(stocks=stocks)
 
-# Forex rates endpoint
-@app.get("/forex", response_model=ForexResponse)
-async def get_forex_rates_endpoint():
-    """Get current forex exchange rates"""
-    logger.info("Fetching forex rates")
+
+
+# NEW: High-performance batch endpoint
+@app.post("/batch", response_model=BatchDataResponse)
+async def get_batch_data(request: BatchDataRequest, background_tasks: BackgroundTasks):
+    """🚀 Get all requested data for multiple tickers in parallel with caching"""
+    logger.info(f"Batch request for {len(request.tickers)} tickers")
+    start_time = time.time()
     
-    rates = get_forex_rates_detailed()
-    return ForexResponse(rates=rates)
+    # Process all tickers in parallel using asyncio
+    tasks = [process_ticker_batch(ticker, request) for ticker in request.tickers]
+    ticker_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Handle any exceptions
+    successful_results = []
+    for i, result in enumerate(ticker_results):
+        if isinstance(result, Exception):
+            logger.error(f"Error processing ticker {request.tickers[i]}: {str(result)}")
+            # Create error result
+            error_result = BatchTickerData(
+                ticker=request.tickers[i],
+                processing_time_ms=0
+            )
+            successful_results.append(error_result)
+        else:
+            successful_results.append(result)
+    
+    total_time = (time.time() - start_time) * 1000
+    
+    # Count cache hits vs fresh fetches (simplified)
+    cached_count = sum(1 for result in successful_results if result.processing_time_ms < 50)  # Assume <50ms = cache hit
+    fresh_count = len(successful_results) - cached_count
+    
+    # Schedule cache cleanup in background
+    background_tasks.add_task(cache.clear_expired)
+    
+    return BatchDataResponse(
+        tickers=successful_results,
+        total_processing_time_ms=total_time,
+        cached_responses=cached_count,
+        fresh_responses=fresh_count
+    )
+
+# Cache management endpoints
+@app.get("/cache/stats")
+async def cache_stats():
+    """Get cache statistics"""
+    total_entries = len(cache._cache)
+    cache_size_mb = sum(len(str(v)) for v in cache._cache.values()) / (1024 * 1024)
+    
+    # Count entries by type
+    entry_types = {}
+    for key in cache._cache.keys():
+        data_type = key.split('_')[0] if '_' in key else 'unknown'
+        entry_types[data_type] = entry_types.get(data_type, 0) + 1
+    
+    return {
+        "total_entries": total_entries,
+        "cache_size_mb": round(cache_size_mb, 2),
+        "entry_types": entry_types,
+        "cache_ttl_settings": CACHE_TTL,
+        "timestamp": datetime.now()
+    }
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear all cache entries"""
+    cache._cache.clear()
+    cache._timestamps.clear()
+    return {"message": "Cache cleared successfully", "timestamp": datetime.now()}
 
 # Health check endpoint
 @app.get("/health")
